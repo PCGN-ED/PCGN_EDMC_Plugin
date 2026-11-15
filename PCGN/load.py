@@ -2,7 +2,8 @@
 # Sends Elite Dangerous journal events to your backend with batching + gzip.
 # Toggle DEBUG=True to post every event immediately and print verbose logs.
 
-import time, json, gzip, threading, queue
+import time, json, gzip, threading, queue, os, re
+from datetime import datetime, timezone
 from typing import Optional
 
 import tkinter as tk
@@ -13,16 +14,22 @@ import webbrowser
 from tkinter import font as tkfont
 
 PLUGIN_NAME = "PCGN"
+# Bump on every release. The server compares this with the newest GitHub release
+# and tells the commander on the dashboard whether the plugin is up to date.
+PLUGIN_VERSION = "1.2.0"
+RELEASES_URL = "https://github.com/PCGN-ED/PCGN_EDMC_Plugin/releases"
 
 # ---------- Debug / hardcoded settings ----------
 DEBUG = False  # set False after you verify events flow
 
 SERVER_BASE = "https://elitedashboard-backend-production.up.railway.app"  # <-- change if needed
 POST_PATH   = "/api/ingest/journal"
+STATUS_PATH = "/api/ingest/status"
 
 # In debug: send every event immediately; otherwise use larger batch
 BATCH_SIZE  = 1 if DEBUG else 50
 FLUSH_SECS  = 1 if DEBUG else 5
+REPLAY_CHUNK = 200  # events per upload while replaying the current journal
 
 # ---------- Config key (only the token is in prefs) ----------
 CFG_TOKEN = "PCGN_Token"
@@ -31,6 +38,7 @@ CFG_TOKEN = "PCGN_Token"
 token_var: Optional[tk.StringVar] = None
 session = requests.Session()
 session.headers.update({"Content-Type": "application/json"})
+session.headers.update({"X-PCGN-Plugin-Version": PLUGIN_VERSION})
 
 _lock = threading.Lock()
 _batch = []
@@ -88,12 +96,105 @@ def _post_summary(raw_bytes: bytes) -> str:
     except Exception:
         return "{}"
 
+# ---------- Journal replay ----------
+_JOURNAL_RE = re.compile(r"^Journal(Alpha|Beta)?\.\d{2,4}-?\d{2}-?\d{2}T?\d{6}(\.\d+)?\.log$")
+
+def _journal_dir() -> Optional[str]:
+    try:
+        d = config.get_str("journaldir") or getattr(config, "default_journal_dir", None)
+        return str(d) if d else None
+    except Exception:
+        return None
+
+def _read_latest_journal() -> tuple[str, list]:
+    """Snapshot the newest journal file as (file name, [(line number, raw line)])."""
+    d = _journal_dir()
+    if not d or not os.path.isdir(d):
+        return "", []
+    files = [f for f in os.listdir(d) if _JOURNAL_RE.match(f)]
+    if not files:
+        return "", []
+    newest = max(files, key=lambda f: os.path.getmtime(os.path.join(d, f)))
+    lines = []
+    with open(os.path.join(d, newest), "rb") as fh:
+        for n, raw in enumerate(fh, start=1):
+            if raw.strip():
+                lines.append((n, raw))
+    return newest, lines
+
+def _parse_ts(s: str) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def _fetch_cutoff() -> tuple[bool, Optional[datetime]]:
+    """Ask the server where its data ends. Returns (ok, last_journal_received)."""
+    delay = 2.0
+    for _ in range(4):
+        tok = _get_token()
+        if not tok:
+            return False, None
+        try:
+            resp = session.get(SERVER_BASE + STATUS_PATH, headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+            if resp.status_code == 200:
+                return True, _parse_ts(resp.json().get("last_journal_received") or "")
+            if resp.status_code in (401, 403):
+                return False, None
+        except Exception as e:
+            if DEBUG:
+                print(f"[{PLUGIN_NAME}] replay status error: {e}")
+        time.sleep(delay)
+        delay *= 2
+    return False, None
+
+def _replay_worker(file_name: str, lines: list):
+    """Upload journal lines the server hasn't seen (e.g. EDMC started after the game)."""
+    try:
+        if not lines:
+            return
+        ok, cutoff = _fetch_cutoff()
+        if not ok:
+            print(f"[{PLUGIN_NAME}] replay skipped: server status unavailable")
+            return
+        events = []
+        for n, raw in lines:
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            ts = _parse_ts(entry.get("timestamp", ""))
+            if ts is None or not entry.get("event"):
+                continue
+            # Strictly newer only: older events are already stored, and live events
+            # use a different idempotency key, so replaying them would double count.
+            if cutoff is not None and ts <= cutoff:
+                continue
+            entry["idempotency_key"] = f"{file_name}::{n}"
+            entry["file"] = entry["_file"] = file_name
+            entry["line"] = entry["_line"] = n
+            events.append(entry)
+        for i in range(0, len(events), REPLAY_CHUNK):
+            q.put(events[i:i + REPLAY_CHUNK])
+        print(f"[{PLUGIN_NAME}] replayed {len(events)} journal events from {file_name}")
+    except Exception as e:
+        print(f"[{PLUGIN_NAME}] replay error: {e}")
+
 # ---------- EDMC entrypoints ----------
 def plugin_start3(plugin_dir: str) -> str:
     _start_threads()
     tok_len = len(_get_token())
-    print(f"[{PLUGIN_NAME}] loaded from {plugin_dir}")
+    print(f"[{PLUGIN_NAME}] v{PLUGIN_VERSION} loaded from {plugin_dir}")
     print(f"[{PLUGIN_NAME}] server={SERVER_BASE}{POST_PATH} batch={BATCH_SIZE} flush={FLUSH_SECS} token_len={tok_len} debug={DEBUG}")
+    # Snapshot now, before EDMC starts delivering live events, so the two never overlap.
+    try:
+        file_name, lines = _read_latest_journal()
+    except Exception as e:
+        print(f"[{PLUGIN_NAME}] could not read journal for replay: {e}")
+        file_name, lines = "", []
+    if lines and tok_len:
+        threading.Thread(target=_replay_worker, args=(file_name, lines), name="PCGN-replay", daemon=True).start()
     return PLUGIN_NAME
 
 def plugin_stop():
@@ -136,9 +237,12 @@ def plugin_prefs(parent: nb.Notebook, cmdr: str, is_beta: bool) -> Optional[tk.F
             nb.Label(frame, text=after).grid(row=r, column=col, padx=(0, 10), pady=5, sticky=tk.W)
 
     _add_link_sentence("Please visit ", "https://elite.pcgn.net", " to get your Commander API key.", "https://elite.pcgn.net", 1)
-    _add_link_sentence("Visit us in Discord: ", "https://discord.pcgn.net", "", "https://discord.pcgn.net", 2)
+    _add_link_sentence("Join us on GameVox: ", "https://gamevox.com/join/JTHK-2958", "", "https://gamevox.com/join/JTHK-2958", 2)
+    _add_link_sentence("Visit us in Discord: ", "https://discord.pcgn.net", "", "https://discord.pcgn.net", 3)
 
-    nb.Button(frame, text="Save", command=_save_prefs).grid(row=3, column=1, padx=10, pady=8, sticky=tk.E)
+    nb.Button(frame, text="Save", command=_save_prefs).grid(row=4, column=1, padx=10, pady=8, sticky=tk.E)
+    nb.Label(frame, text=f"Plugin version: {PLUGIN_VERSION}").grid(row=5, column=0, padx=10, pady=5, sticky=tk.W)
+    _add_link_sentence("Updates: ", RELEASES_URL, "", RELEASES_URL, 6)
     return frame
 
 def prefs_changed(cmdr: str, is_beta: bool) -> None:
